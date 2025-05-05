@@ -20,7 +20,7 @@ jobs:
 
     - name: Download files from Google Drive
       run: |
-        curl -L -o best_model.pth "https://www.dropbox.com/scl/fi/hzfnbfruuxgzju3o5iokc/test.pth?rlkey=rz9tahqzczmmu9726kx8t8uhb&st=vhcam765&dl=0"
+        curl -L -o best_model.pth "https://www.dropbox.com/scl/fi/j8lsl52vbcys8d5pa3by8/model-1.pth?rlkey=quceuykqnxwbcv9p7lnndkggh&st=5qy3nxt0&dl=0"
     - name: 1. Creating virtual env
       uses: actions/setup-python@v4
       with:
