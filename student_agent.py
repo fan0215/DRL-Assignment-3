@@ -13,7 +13,7 @@ class Config:
     FRAME_STACK = 4
     DEATH_PENALTY = -100
     ACTION_SPACE = 12
-    MODEL_PATH = "mario_rainbow_dqn_latest.pth"
+    MODEL_PATH = "best_model.pth"
 
 # 帶有 noisy layer 的線性層（請確保 NoisyLinear 有定義在其他地方或引入）
 class NoisyLinear(nn.Module):
@@ -61,7 +61,7 @@ class DQNNetwork(nn.Module):
                 module.reset_noise()
 
 # Mario 智能體：負責接收影格並輸出動作
-class MarioAgent:
+class Agent:
     def __init__(self, model_path=Config.MODEL_PATH):
         self.device = torch.device("cpu")
         self.frame_skip = Config.FRAME_SKIP
