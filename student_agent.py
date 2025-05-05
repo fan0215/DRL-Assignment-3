@@ -1,218 +1,113 @@
-import random
-import cv2
-import os
-import gc
 import gym
-import gym_super_mario_bros
-from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
-from nes_py.wrappers import JoypadSpace
-from collections import deque, namedtuple
-import time
-from tqdm import tqdm
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
+from torchvision import transforms
+from collections import deque
 
+# 設定參數與常數
+class Config:
+    ENV_NAME = "SuperMarioBros-v0"
+    IMAGE_SIZE = (84, 84)
+    FRAME_SKIP = 4
+    FRAME_STACK = 4
+    DEATH_PENALTY = -100
+    ACTION_SPACE = 12
+    MODEL_PATH = "mario_rainbow_dqn_latest.pth"
 
-# Noisy Linear Layer 
+# 帶有 noisy layer 的線性層（請確保 NoisyLinear 有定義在其他地方或引入）
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, sigma_init=0.5):
-        super(NoisyLinear, self).__init__()
-        
-        self.in_features = in_features
-        self.out_features = out_features
-        self.sigma_init = sigma_init
-        
-        # Learnable parameters
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.empty(out_features))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features))
-        
-        # Reset parameters
-        self.reset_parameters()
-        
-        # Register buffers for noise
-        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
-        self.register_buffer('bias_epsilon', torch.empty(out_features))
-        self.reset_noise()
-    
-    def reset_parameters(self):
-        """Initialize the parameters"""
-        mu_range = 1 / np.sqrt(self.in_features)
-        
-        self.weight_mu.data.uniform_(-mu_range, mu_range)
-        self.weight_sigma.data.fill_(self.sigma_init / np.sqrt(self.in_features))
-        
-        self.bias_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_sigma.data.fill_(self.sigma_init / np.sqrt(self.out_features))
-    
-    def _scale_noise(self, size):
-        """Generate factorized Gaussian noise"""
-        x = torch.randn(size, device=self.weight_mu.device)
-        return x.sign().mul_(x.abs().sqrt_())
-    
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        return self.linear(x)
+
     def reset_noise(self):
-        """Reset the factorized noise"""
-        epsilon_in = self._scale_noise(self.in_features)
-        epsilon_out = self._scale_noise(self.out_features)
-        
-        # Outer product
-        self.weight_epsilon.copy_(torch.outer(epsilon_out, epsilon_in))
-        self.bias_epsilon.copy_(epsilon_out)
-    
-    def forward(self, x):
-        """Forward pass with noise"""
-        # During evaluation (for the agent), only use the mean values
-        weight = self.weight_mu
-        bias = self.bias_mu
-        
-        return F.linear(x, weight, bias)
+        pass  # 若使用真正的 NoisyNet 實作需補上
 
-
-# Dueling CNN architecture
-class DuelingCNN(nn.Module):
-    def __init__(self, in_channels, num_actions, sigma_init=0.5):
-        super(DuelingCNN, self).__init__()
-        
-        # Feature extraction layers
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten()
+# Rainbow DQN 主網路，包含 dueling 架構
+class DQNNetwork(nn.Module):
+    def __init__(self, input_frames, num_actions):
+        super().__init__()
+        self.extractor = nn.Sequential(
+            nn.Conv2d(input_frames, 32, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU()
         )
-        
-        # Calculate feature size
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, in_channels, 84, 90)
-            feature_size = self.conv_layers(dummy_input).shape[1]
-        
-        # Value stream (state value V(s))
+        dummy_input = torch.zeros(1, input_frames, *Config.IMAGE_SIZE)
+        feature_dim = self.extractor(dummy_input).view(1, -1).size(1)
+
         self.value_stream = nn.Sequential(
-            NoisyLinear(feature_size, 512, sigma_init),
-            nn.ReLU(),
-            NoisyLinear(512, 1, sigma_init)
+            NoisyLinear(feature_dim, 512), nn.ReLU(),
+            NoisyLinear(512, 1)
         )
-        
-        # Advantage stream (action advantage A(s,a))
+
         self.advantage_stream = nn.Sequential(
-            NoisyLinear(feature_size, 512, sigma_init),
-            nn.ReLU(),
-            NoisyLinear(512, num_actions, sigma_init)
+            NoisyLinear(feature_dim, 512), nn.ReLU(),
+            NoisyLinear(512, num_actions)
         )
-    
+
     def forward(self, x):
-        """Forward pass combining value and advantage streams"""
-        features = self.conv_layers(x)
-        
+        features = self.extractor(x).view(x.size(0), -1)
         value = self.value_stream(features)
         advantage = self.advantage_stream(features)
-        
-        # Combine value and advantage (dueling architecture)
-        # Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
         return value + advantage - advantage.mean(dim=1, keepdim=True)
-    
+
     def reset_noise(self):
-        """Reset noise for all noisy layers"""
-        # Reset noise in value stream
-        for module in self.value_stream.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
-        
-        # Reset noise in advantage stream
-        for module in self.advantage_stream.modules():
+        for module in self.modules():
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
 
-
-class Agent(object):
-    """Agent that acts using a loaded DQN model."""
-    def __init__(self):
-        self.action_space = gym.spaces.Discrete(12)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.frame_stack = 4
-        self.frame_buffer = deque(maxlen=self.frame_stack)
-        for _ in range(self.frame_stack):
-            self.frame_buffer.append(np.zeros((84, 90), dtype=np.float32))
-        self.skip_frames = 3
-        self.skip_count = 0
-        self.last_action = 0
-        
+# Mario 智能體：負責接收影格並輸出動作
+class MarioAgent:
+    def __init__(self, model_path=Config.MODEL_PATH):
+        self.device = torch.device("cpu")
+        self.frame_skip = Config.FRAME_SKIP
+        self.action_space = gym.spaces.Discrete(Config.ACTION_SPACE)
+        self.frame_buffer = deque(maxlen=Config.FRAME_STACK)
+        self.need_init = True
         self.step_counter = 0
-        
-        self.model = DuelingCNN(self.frame_stack, 12).to(self.device)
-        
-        try:
-            self.model.load_state_dict(torch.load('models/rainbow_icm_best.pth', map_location=self.device))
-            print("Model loaded")
-        except:
-            print("Failed to load model. Ensuring compatibility with evaluation.")
-            try:
-                # Try alternate locations
-                model_paths = [
-                    'rainbow_icm_best.pth',
-                    'best_model.pth',
-                    'mario_dueling_dqn.pth'
-                ]
-                
-                for path in model_paths:
-                    try:
-                        self.model.load_state_dict(torch.load(path, map_location=self.device))
-                        print(f"Model loaded from {path}")
-                        break
-                    except:
-                        continue
-            except:
-                print("All model loading attempts failed. Using untrained model.")
-        
-        self.model.eval()
+        self.cached_action = 0
 
-    def preprocess_frame(self, frame):
-        """Convert RGB to grayscale and resize to 84x90"""
-        try:
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            resized = cv2.resize(gray, (90, 84), interpolation=cv2.INTER_AREA)
-            
-            normalized = resized.astype(np.float32) / 255.0
-            
-            return normalized
-        except Exception as e:
-            print(f"Error in preprocessing: {e}")
-            return np.zeros((84, 90), dtype=np.float32)
+        self.policy_net = DQNNetwork(Config.FRAME_STACK, self.action_space.n)
+        self.policy_net.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.policy_net.eval()
 
-    def act(self, observation):
-        try:
-            self.step_counter += 1
-            
-            if self.skip_count > 0:
-                self.skip_count -= 1
-                return self.last_action
-                
-            processed_frame = self.preprocess_frame(observation)
-            
-            self.frame_buffer.append(processed_frame)
-            
-            stacked_frames = np.array(self.frame_buffer)
-            
+        # 處理影像的流程
+        self.preprocess = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Grayscale(),
+            transforms.Resize(Config.IMAGE_SIZE),
+            transforms.ToTensor()
+        ])
+
+    def _prepare_input(self, frame):
+        # 預處理輸入畫面
+        tensor = self.preprocess(frame) / 255.0
+        return tensor
+
+    def select_action(self, frame):
+        # 將畫面轉換為 state 並儲存進 frame buffer
+        processed = self._prepare_input(frame)
+
+        if self.need_init:
+            self.frame_buffer.clear()
+            for _ in range(Config.FRAME_STACK):
+                self.frame_buffer.append(processed)
+            self.need_init = False
+            self.step_counter = 1
+            return 0
+
+        self.step_counter = (self.step_counter + 1) % self.frame_skip
+
+        if self.step_counter == 1:
+            self.frame_buffer.append(processed)
             with torch.no_grad():
-                state_tensor = torch.FloatTensor(stacked_frames).unsqueeze(0).to(self.device)
-                q_values = self.model(state_tensor)
-                action = q_values.argmax(1).item()
-            
-            self.last_action = action
-            self.skip_count = self.skip_frames
-            
-            if self.step_counter % 50 == 0:
-                gc.collect()
-                
-            return action
-            
-        except Exception as e:
-            print(f"Error in act method: {e}")
-            return self.action_space.sample()
+                # 將 frame stack 合併為一個輸入 tensor
+                stacked = torch.stack(list(self.frame_buffer)).unsqueeze(0).to(self.device)
+                q_values = self.policy_net(stacked)
+                self.cached_action = q_values.argmax(dim=1).item()
+
+        return self.cached_action
