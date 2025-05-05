@@ -1,10 +1,21 @@
+import random
+import cv2
+import os
+import gc
 import gym
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
+from nes_py.wrappers import JoypadSpace
+from collections import deque, namedtuple
+import time
+from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import cv2
 
+
+# Noisy Linear Layer 
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, sigma_init=0.5):
         super(NoisyLinear, self).__init__()
@@ -59,6 +70,8 @@ class NoisyLinear(nn.Module):
         
         return F.linear(x, weight, bias)
 
+
+# Dueling CNN architecture
 class DuelingCNN(nn.Module):
     def __init__(self, in_channels, num_actions, sigma_init=0.5):
         super(DuelingCNN, self).__init__()
@@ -116,92 +129,90 @@ class DuelingCNN(nn.Module):
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
 
+
 class Agent(object):
-    """Agent that acts using a loaded DQN model for Super Mario Bros."""
+    """Agent that acts using a loaded DQN model."""
     def __init__(self):
-        # Initialize action space (12 actions from COMPLEX_MOVEMENT)
         self.action_space = gym.spaces.Discrete(12)
-        
-        # Set device to GPU if available, otherwise CPU
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Number of frames to stack for temporal information
         self.frame_stack = 4
-        
-        # Initialize frame buffer as a NumPy array for efficiency
-        self.frame_buffer = np.zeros((self.frame_stack, 84, 90), dtype=np.float32)
-        
-        # Number of frames to skip (action repeated for 4 frames total)
+        self.frame_buffer = deque(maxlen=self.frame_stack)
+        for _ in range(self.frame_stack):
+            self.frame_buffer.append(np.zeros((84, 90), dtype=np.float32))
         self.skip_frames = 3
         self.skip_count = 0
         self.last_action = 0
         
-        # Track total steps for potential monitoring
         self.step_counter = 0
         
-        # Initialize the Dueling CNN model
         self.model = DuelingCNN(self.frame_stack, 12).to(self.device)
         
-        # Load pre-trained model weights
         try:
             self.model.load_state_dict(torch.load('models/rainbow_icm_best.pth', map_location=self.device))
-            print("Model loaded successfully")
-        except Exception as e:
-            print(f"Failed to load model: {e}")
+            print("Model loaded")
+        except:
+            print("Failed to load model. Ensuring compatibility with evaluation.")
+            try:
+                # Try alternate locations
+                model_paths = [
+                    'rainbow_icm_best.pth',
+                    'best_model.pth',
+                    'mario_dueling_dqn.pth'
+                ]
+                
+                for path in model_paths:
+                    try:
+                        self.model.load_state_dict(torch.load(path, map_location=self.device))
+                        print(f"Model loaded from {path}")
+                        break
+                    except:
+                        continue
+            except:
+                print("All model loading attempts failed. Using untrained model.")
         
-        # Set model to evaluation mode (no noise in NoisyLinear layers)
         self.model.eval()
 
     def preprocess_frame(self, frame):
-        """Convert RGB frame to grayscale, resize to 84x90, and normalize."""
+        """Convert RGB to grayscale and resize to 84x90"""
         try:
-            # Convert RGB to grayscale
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             
-            # Resize to 84x90 maintaining aspect ratio similar to 240x256
             resized = cv2.resize(gray, (90, 84), interpolation=cv2.INTER_AREA)
             
-            # Normalize to [0, 1]
             normalized = resized.astype(np.float32) / 255.0
+            
             return normalized
-        except cv2.error as e:
-            print(f"OpenCV error in preprocessing: {e}")
-            return np.zeros((84, 90), dtype=np.float32)
         except Exception as e:
-            print(f"Unexpected error in preprocessing: {e}")
+            print(f"Error in preprocessing: {e}")
             return np.zeros((84, 90), dtype=np.float32)
 
     def act(self, observation):
-        """Select an action based on the current observation using the DQN model."""
         try:
             self.step_counter += 1
             
-            # Repeat the last action if skipping frames
             if self.skip_count > 0:
                 self.skip_count -= 1
                 return self.last_action
                 
-            # Preprocess the new observation
             processed_frame = self.preprocess_frame(observation)
             
-            # Update frame buffer by shifting and adding new frame
-            self.frame_buffer = np.roll(self.frame_buffer, -1, axis=0)
-            self.frame_buffer[-1] = processed_frame
+            self.frame_buffer.append(processed_frame)
             
-            # Compute action using the model
+            stacked_frames = np.array(self.frame_buffer)
+            
             with torch.no_grad():
-                # Convert frame buffer to tensor efficiently
-                state_tensor = torch.from_numpy(self.frame_buffer).unsqueeze(0).to(self.device)
+                state_tensor = torch.FloatTensor(stacked_frames).unsqueeze(0).to(self.device)
                 q_values = self.model(state_tensor)
                 action = q_values.argmax(1).item()
             
-            # Store action and reset skip counter
             self.last_action = action
             self.skip_count = self.skip_frames
             
+            if self.step_counter % 50 == 0:
+                gc.collect()
+                
             return action
             
         except Exception as e:
             print(f"Error in act method: {e}")
-            # Fallback to random action in case of error
             return self.action_space.sample()
