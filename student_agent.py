@@ -173,11 +173,11 @@ class Agent(object):
         self.model = DuelingCNN(self.frame_stack, self.action_space.n).to(self.device)
 
         # Load the trained model weights
-        model_path = 'models/rainbow_icm_best.pth' # Target the best model saved during training
+        model_path = 'best_model.pth' # Target the best model saved during training
         # Also try the final model if the best isn't found
-        fallback_model_path = 'models/rainbow_icm_final.pth'
+        fallback_model_path = 'best_model.pth'
         # Default path if neither is found (or use the standard name from save())
-        default_model_path = 'models/rainbow_icm_model.pth'
+        default_model_path = 'best_model.pth'
 
         loaded = False
         if os.path.exists(model_path):
